@@ -38,8 +38,12 @@ class MagikImageResize(io.ComfyNode):
     UPSCALE_METHODS = ["nearest-exact", "bilinear", "area", "bicubic", "lanczos", "nvidia_rtx_vsr"]
     OUTPAINT_MODE = "pad for outpaint"
     MEGAPIXEL_MODE = "Target Pixel Budget (Megapixels)"
+    LONGEST_EDGE_MODE = "longest edge"
+    SHORTEST_EDGE_MODE = "shortest edge"
+    EDGE_MODES = {LONGEST_EDGE_MODE, SHORTEST_EDGE_MODE}
+    RESIZE_DIRECTIONS = ["resize all", "upscale only", "downscale only"]
     KEEP_PROPORTION_MODES = [
-        "stretch", "resize", "pad", "pad_edge", "pad_edge_pixel",
+        "stretch", "resize", LONGEST_EDGE_MODE, SHORTEST_EDGE_MODE, "pad", "pad_edge", "pad_edge_pixel",
         OUTPAINT_MODE, "crop", "pillarbox_blur", MEGAPIXEL_MODE,
     ]
     MEGAPIXEL_OPTIONS = [
@@ -69,6 +73,13 @@ highest dimension.
 "Target Pixel Budget (Megapixels)" uses the dedicated target_megapixels menu
 to automatically scale the image to a total pixel budget while preserving its original aspect ratio.
 
+"longest edge" / "shortest edge" scale the image so that its longest (or shortest)
+edge matches the requested size - the larger (or smaller) of the width/height
+inputs, ignoring zeros - while preserving the aspect ratio. The edge_direction
+dropdown decides whether the resize is applied at all: "resize all" always applies
+it, "upscale only" skips it when it would reduce the dimensions, and "downscale
+only" skips it when it would increase them.
+
 "pad for outpaint" is different from the other modes: the image itself is
 left at its original resolution (no scaling at all) and is instead placed
 onto a new canvas of the requested width/height. Areas of the new canvas
@@ -84,6 +95,7 @@ dimension, that dimension is cropped instead of padded.
                 io.Combo.Input("upscale_method", options=cls.UPSCALE_METHODS),
                 io.Combo.Input("keep_proportion", options=cls.KEEP_PROPORTION_MODES, default="stretch", tooltip="Strategy for aspect ratio management. 'Target Pixel Budget' uses the megapixels dropdown below."),
                 io.Combo.Input("target_megapixels", options=cls.MEGAPIXEL_OPTIONS, default="1.0 MP (~1024x1024)", tooltip="Target total pixel count when 'Target Pixel Budget' is selected."),
+                io.Combo.Input("edge_direction", options=cls.RESIZE_DIRECTIONS, default="resize all", tooltip="Only used with 'longest edge' / 'shortest edge': 'resize all' always applies the resize, 'upscale only' skips it if it would reduce the dimensions, 'downscale only' skips it if it would increase them."),
                 io.String.Input("pad_color", default="0, 0, 0", tooltip="Color to use for padding."),
                 io.Combo.Input("crop_position", options=cls.CROP_POSITIONS, default="center"),
                 io.Int.Input("divisible_by", default=2, min=0, max=512, step=1),
@@ -127,12 +139,17 @@ dimension, that dimension is cropped instead of padded.
         return torch.device("cpu")
 
     @classmethod
-    def _compute_target_size(cls, W, H, width, height, keep_proportion, target_megapixels="1.0 MP (~1024x1024)"):
+    def _compute_target_size(cls, W, H, width, height, keep_proportion, target_megapixels="1.0 MP (~1024x1024)", edge_direction="resize all"):
         """
         Work out the final (pre-padding) width/height given the source
         dimensions and the requested keep_proportion mode.
         """
-        needs_fit = keep_proportion in ("resize", cls.MEGAPIXEL_MODE) or keep_proportion in cls.PAD_MODES or keep_proportion == "pillarbox_blur"
+        needs_fit = (
+            keep_proportion in ("resize", cls.MEGAPIXEL_MODE)
+            or keep_proportion in cls.EDGE_MODES
+            or keep_proportion in cls.PAD_MODES
+            or keep_proportion == "pillarbox_blur"
+        )
 
         if not needs_fit:
             new_width = width if width != 0 else W
@@ -152,6 +169,18 @@ dimension, that dimension is cropped instead of padded.
             aspect_ratio = W / H
             new_height = int(math.sqrt(total_pixels / aspect_ratio))
             new_width = int(math.sqrt(total_pixels * aspect_ratio))
+        elif keep_proportion in cls.EDGE_MODES:
+            requested = [d for d in (width, height) if d != 0]
+            if not requested:
+                return W, H
+            if keep_proportion == cls.LONGEST_EDGE_MODE:
+                target_edge, source_edge = max(requested), max(W, H)
+            else:
+                target_edge, source_edge = min(requested), min(W, H)
+            scale = target_edge / source_edge
+            if (edge_direction == "upscale only" and scale <= 1) or (edge_direction == "downscale only" and scale >= 1):
+                return W, H
+            new_width, new_height = max(1, round(W * scale)), max(1, round(H * scale))
         elif width == 0 and height == 0:
             new_width, new_height = W, H
         elif width == 0:
@@ -238,7 +267,7 @@ dimension, that dimension is cropped instead of padded.
 
     @classmethod
     def execute(cls, image, width, height, keep_proportion, upscale_method, divisible_by,
-                pad_color, crop_position, target_megapixels="1.0 MP (~1024x1024)", device="cpu", mask=None, per_batch=64):
+                pad_color, crop_position, target_megapixels="1.0 MP (~1024x1024)", edge_direction="resize all", device="cpu", mask=None, per_batch=64):
         unique_id = cls.hidden.unique_id
 
         B, H, W, C = image.shape
@@ -253,7 +282,7 @@ dimension, that dimension is cropped instead of padded.
         else:
             out_image, out_mask = cls._run_standard(
                 image, mask, width, height, keep_proportion, upscale_method, divisible_by,
-                pad_color, crop_position, target_megapixels, device, per_batch, unique_id,
+                pad_color, crop_position, target_megapixels, edge_direction, device, per_batch, unique_id,
             )
 
         try:
@@ -275,14 +304,14 @@ dimension, that dimension is cropped instead of padded.
 
     @classmethod
     def _run_standard(cls, image, mask, width, height, keep_proportion, upscale_method, divisible_by,
-                       pad_color, crop_position, target_megapixels, device, per_batch, unique_id):
+                       pad_color, crop_position, target_megapixels, edge_direction, device, per_batch, unique_id):
         """Every keep_proportion mode except OUTPAINT_MODE: scales the image content to fit."""
         B, H, W, C = image.shape
 
         pillarbox_blur = keep_proportion == "pillarbox_blur"
         is_pad_mode = keep_proportion in cls.PAD_MODES or pillarbox_blur
 
-        fit_width, fit_height = cls._compute_target_size(W, H, width, height, keep_proportion, target_megapixels)
+        fit_width, fit_height = cls._compute_target_size(W, H, width, height, keep_proportion, target_megapixels, edge_direction)
 
         pad_left = pad_right = pad_top = pad_bottom = 0
         if is_pad_mode:
